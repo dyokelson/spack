@@ -1,4 +1,4 @@
-# Copyright 2013-2023 Lawrence Livermore National Security, LLC and other
+# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
 # Spack Project Developers. See the top-level COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
@@ -123,6 +123,12 @@ class DlaFuture(CMakePackage, CudaPackage, ROCmPackage):
         for val in CudaPackage.cuda_arch_values:
             depends_on("pika cuda_arch={0}".format(val), when="cuda_arch={0}".format(val))
             depends_on("umpire cuda_arch={0}".format(val), when="cuda_arch={0}".format(val))
+
+    patch(
+        "https://github.com/eth-cscs/DLA-Future/pull/1063/commits/efc9c176a7a8c512b3f37d079dec8c25ac1b7389.patch?full_index=1",
+        sha256="7f382c872d89f22da1ad499e85ffe9881cc7404c8465e42877a210a09382e2ea",
+        when="@:0.3 %gcc@13:",
+    )
 
     def cmake_args(self):
         spec = self.spec

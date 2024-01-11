@@ -1,4 +1,4 @@
-# Copyright 2013-2023 Lawrence Livermore National Security, LLC and other
+# Copyright 2013-2024 Lawrence Livermore National Security, LLC and other
 # Spack Project Developers. See the top-level COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
@@ -25,7 +25,7 @@ import urllib.request
 import warnings
 from contextlib import closing, contextmanager
 from gzip import GzipFile
-from typing import Dict, List, NamedTuple, Optional, Set, Tuple
+from typing import Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
 from urllib.error import HTTPError, URLError
 
 import llnl.util.filesystem as fsys
@@ -68,7 +68,10 @@ from spack.util.executable import which
 
 BUILD_CACHE_RELATIVE_PATH = "build_cache"
 BUILD_CACHE_KEYS_RELATIVE_PATH = "_pgp"
-CURRENT_BUILD_CACHE_LAYOUT_VERSION = 1
+
+#: The build cache layout version that this version of Spack creates.
+#: Version 2: includes parent directories of the package prefix in the tarball
+CURRENT_BUILD_CACHE_LAYOUT_VERSION = 2
 
 
 class BuildCacheDatabase(spack_db.Database):
@@ -1174,6 +1177,16 @@ def tarfile_of_spec_prefix(tar: tarfile.TarFile, prefix: str) -> None:
     except OSError:
         files_to_skip = []
 
+    # First add all directories leading up to `prefix` (Spack <= 0.21 did not do this, leading to
+    # issues when tarballs are used in runtimes like AWS lambda). Skip the file system root.
+    parent_dirs = reversed(pathlib.Path(prefix).parents)
+    next(parent_dirs)  # skip the root: slices are supported from python 3.10
+    for parent_dir in parent_dirs:
+        dir_info = tarfile.TarInfo(_tarinfo_name(str(parent_dir)))
+        dir_info.type = tarfile.DIRTYPE
+        dir_info.mode = 0o755
+        tar.addfile(dir_info)
+
     dir_stack = [prefix]
     while dir_stack:
         dir = dir_stack.pop()
@@ -1605,14 +1618,14 @@ def _get_valid_spec_file(path: str, max_supported_layout: int) -> Tuple[Dict, in
     return spec_dict, layout_version
 
 
-def download_tarball(spec, unsigned=False, mirrors_for_spec=None):
+def download_tarball(spec, unsigned: Optional[bool] = False, mirrors_for_spec=None):
     """
     Download binary tarball for given package into stage area, returning
     path to downloaded tarball if successful, None otherwise.
 
     Args:
         spec (spack.spec.Spec): Concrete spec
-        unsigned (bool): Whether or not to require signed binaries
+        unsigned: if ``True`` or ``False`` override the mirror signature verification defaults
         mirrors_for_spec (list): Optional list of concrete specs and mirrors
             obtained by calling binary_distribution.get_mirrors_for_spec().
             These will be checked in order first before looking in other
@@ -1633,7 +1646,9 @@ def download_tarball(spec, unsigned=False, mirrors_for_spec=None):
            "signature_verified": "true-if-binary-pkg-was-already-verified"
        }
     """
-    configured_mirrors = spack.mirror.MirrorCollection(binary=True).values()
+    configured_mirrors: Iterable[spack.mirror.Mirror] = spack.mirror.MirrorCollection(
+        binary=True
+    ).values()
     if not configured_mirrors:
         tty.die("Please add a spack mirror to allow download of pre-compiled packages.")
 
@@ -1651,8 +1666,16 @@ def download_tarball(spec, unsigned=False, mirrors_for_spec=None):
     # mirror for the spec twice though.
     try_first = [i["mirror_url"] for i in mirrors_for_spec] if mirrors_for_spec else []
     try_next = [i.fetch_url for i in configured_mirrors if i.fetch_url not in try_first]
+    mirror_urls = try_first + try_next
 
-    mirrors = try_first + try_next
+    # TODO: turn `mirrors_for_spec` into a list of Mirror instances, instead of doing that here.
+    def fetch_url_to_mirror(url):
+        for mirror in configured_mirrors:
+            if mirror.fetch_url == url:
+                return mirror
+        return spack.mirror.Mirror(url)
+
+    mirrors = [fetch_url_to_mirror(url) for url in mirror_urls]
 
     tried_to_verify_sigs = []
 
@@ -1661,14 +1684,17 @@ def download_tarball(spec, unsigned=False, mirrors_for_spec=None):
     # we remove support for deprecated spec formats and buildcache layouts.
     for try_signed in (True, False):
         for mirror in mirrors:
+            # Override mirror's default if
+            currently_unsigned = unsigned if unsigned is not None else not mirror.signed
+
             # If it's an OCI index, do things differently, since we cannot compose URLs.
-            parsed = urllib.parse.urlparse(mirror)
+            fetch_url = mirror.fetch_url
 
             # TODO: refactor this to some "nice" place.
-            if parsed.scheme == "oci":
-                ref = spack.oci.image.ImageReference.from_string(mirror[len("oci://") :]).with_tag(
-                    spack.oci.image.default_tag(spec)
-                )
+            if fetch_url.startswith("oci://"):
+                ref = spack.oci.image.ImageReference.from_string(
+                    fetch_url[len("oci://") :]
+                ).with_tag(spack.oci.image.default_tag(spec))
 
                 # Fetch the manifest
                 try:
@@ -1705,7 +1731,7 @@ def download_tarball(spec, unsigned=False, mirrors_for_spec=None):
                         except InvalidMetadataFile as e:
                             tty.warn(
                                 f"Ignoring binary package for {spec.name}/{spec.dag_hash()[:7]} "
-                                f"from {mirror} due to invalid metadata file: {e}"
+                                f"from {fetch_url} due to invalid metadata file: {e}"
                             )
                             local_specfile_stage.destroy()
                             continue
@@ -1727,13 +1753,16 @@ def download_tarball(spec, unsigned=False, mirrors_for_spec=None):
                     "tarball_stage": tarball_stage,
                     "specfile_stage": local_specfile_stage,
                     "signature_verified": False,
+                    "signature_required": not currently_unsigned,
                 }
 
             else:
                 ext = "json.sig" if try_signed else "json"
-                specfile_path = url_util.join(mirror, BUILD_CACHE_RELATIVE_PATH, specfile_prefix)
+                specfile_path = url_util.join(
+                    fetch_url, BUILD_CACHE_RELATIVE_PATH, specfile_prefix
+                )
                 specfile_url = f"{specfile_path}.{ext}"
-                spackfile_url = url_util.join(mirror, BUILD_CACHE_RELATIVE_PATH, tarball)
+                spackfile_url = url_util.join(fetch_url, BUILD_CACHE_RELATIVE_PATH, tarball)
                 local_specfile_stage = try_fetch(specfile_url)
                 if local_specfile_stage:
                     local_specfile_path = local_specfile_stage.save_filename
@@ -1746,21 +1775,21 @@ def download_tarball(spec, unsigned=False, mirrors_for_spec=None):
                     except InvalidMetadataFile as e:
                         tty.warn(
                             f"Ignoring binary package for {spec.name}/{spec.dag_hash()[:7]} "
-                            f"from {mirror} due to invalid metadata file: {e}"
+                            f"from {fetch_url} due to invalid metadata file: {e}"
                         )
                         local_specfile_stage.destroy()
                         continue
 
-                    if try_signed and not unsigned:
+                    if try_signed and not currently_unsigned:
                         # If we found a signed specfile at the root, try to verify
                         # the signature immediately.  We will not download the
                         # tarball if we could not verify the signature.
                         tried_to_verify_sigs.append(specfile_url)
                         signature_verified = try_verify(local_specfile_path)
                         if not signature_verified:
-                            tty.warn("Failed to verify: {0}".format(specfile_url))
+                            tty.warn(f"Failed to verify: {specfile_url}")
 
-                    if unsigned or signature_verified or not try_signed:
+                    if currently_unsigned or signature_verified or not try_signed:
                         # We will download the tarball in one of three cases:
                         #     1. user asked for --no-check-signature
                         #     2. user didn't ask for --no-check-signature, but we
@@ -1783,6 +1812,7 @@ def download_tarball(spec, unsigned=False, mirrors_for_spec=None):
                                 "tarball_stage": tarball_stage,
                                 "specfile_stage": local_specfile_stage,
                                 "signature_verified": signature_verified,
+                                "signature_required": not currently_unsigned,
                             }
 
                     local_specfile_stage.destroy()
@@ -1981,7 +2011,7 @@ def relocate_package(spec):
             relocate.relocate_text(text_names, prefix_to_prefix_text)
 
 
-def _extract_inner_tarball(spec, filename, extract_to, unsigned, remote_checksum):
+def _extract_inner_tarball(spec, filename, extract_to, signature_required: bool, remote_checksum):
     stagepath = os.path.dirname(filename)
     spackfile_name = tarball_name(spec, ".spack")
     spackfile_path = os.path.join(stagepath, spackfile_name)
@@ -2001,7 +2031,7 @@ def _extract_inner_tarball(spec, filename, extract_to, unsigned, remote_checksum
     else:
         raise ValueError("Cannot find spec file for {0}.".format(extract_to))
 
-    if not unsigned:
+    if signature_required:
         if os.path.exists("%s.asc" % specfile_path):
             suppress = config.get("config:suppress_gpg_warnings", False)
             try:
@@ -2030,11 +2060,12 @@ def _extract_inner_tarball(spec, filename, extract_to, unsigned, remote_checksum
 
 
 def _tar_strip_component(tar: tarfile.TarFile, prefix: str):
-    """Strip the top-level directory `prefix` from the member names in a tarfile."""
+    """Yield all members of tarfile that start with given prefix, and strip that prefix (including
+    symlinks)"""
     # Including trailing /, otherwise we end up with absolute paths.
     regex = re.compile(re.escape(prefix) + "/*")
 
-    # Remove the top-level directory from the member (link)names.
+    # Only yield members in the package prefix.
     # Note: when a tarfile is created, relative in-prefix symlinks are
     # expanded to matching member names of tarfile entries. So, we have
     # to ensure that those are updated too.
@@ -2042,15 +2073,17 @@ def _tar_strip_component(tar: tarfile.TarFile, prefix: str):
     # them.
     for m in tar.getmembers():
         result = regex.match(m.name)
-        assert result is not None
+        if not result:
+            continue
         m.name = m.name[result.end() :]
         if m.linkname:
             result = regex.match(m.linkname)
             if result:
                 m.linkname = m.linkname[result.end() :]
+        yield m
 
 
-def extract_tarball(spec, download_result, unsigned=False, force=False, timer=timer.NULL_TIMER):
+def extract_tarball(spec, download_result, force=False, timer=timer.NULL_TIMER):
     """
     extract binary tarball for given package into install area
     """
@@ -2076,7 +2109,8 @@ def extract_tarball(spec, download_result, unsigned=False, force=False, timer=ti
     bchecksum = spec_dict["binary_cache_checksum"]
 
     filename = download_result["tarball_stage"].save_filename
-    signature_verified = download_result["signature_verified"]
+    signature_verified: bool = download_result["signature_verified"]
+    signature_required: bool = download_result["signature_required"]
     tmpdir = None
 
     if layout_version == 0:
@@ -2085,12 +2119,14 @@ def extract_tarball(spec, download_result, unsigned=False, force=False, timer=ti
         # and another tarball containing the actual install tree.
         tmpdir = tempfile.mkdtemp()
         try:
-            tarfile_path = _extract_inner_tarball(spec, filename, tmpdir, unsigned, bchecksum)
+            tarfile_path = _extract_inner_tarball(
+                spec, filename, tmpdir, signature_required, bchecksum
+            )
         except Exception as e:
             _delete_staged_downloads(download_result)
             shutil.rmtree(tmpdir)
             raise e
-    elif layout_version == 1:
+    elif 1 <= layout_version <= 2:
         # Newer buildcache layout: the .spack file contains just
         # in the install tree, the signature, if it exists, is
         # wrapped around the spec.json at the root.  If sig verify
@@ -2098,9 +2134,10 @@ def extract_tarball(spec, download_result, unsigned=False, force=False, timer=ti
         # the tarball.
         tarfile_path = filename
 
-        if not unsigned and not signature_verified:
+        if signature_required and not signature_verified:
             raise UnsignedPackageException(
-                "To install unsigned packages, use the --no-check-signature option."
+                "To install unsigned packages, use the --no-check-signature option, "
+                "or configure the mirror with signed: false."
             )
 
         # compute the sha256 checksum of the tarball
@@ -2117,8 +2154,10 @@ def extract_tarball(spec, download_result, unsigned=False, force=False, timer=ti
     try:
         with closing(tarfile.open(tarfile_path, "r")) as tar:
             # Remove install prefix from tarfil to extract directly into spec.prefix
-            _tar_strip_component(tar, prefix=_ensure_common_prefix(tar))
-            tar.extractall(path=spec.prefix)
+            tar.extractall(
+                path=spec.prefix,
+                members=_tar_strip_component(tar, prefix=_ensure_common_prefix(tar)),
+            )
     except Exception:
         shutil.rmtree(spec.prefix, ignore_errors=True)
         _delete_staged_downloads(download_result)
@@ -2153,20 +2192,47 @@ def extract_tarball(spec, download_result, unsigned=False, force=False, timer=ti
 
 
 def _ensure_common_prefix(tar: tarfile.TarFile) -> str:
-    # Get the shortest length directory.
-    common_prefix = min((e.name for e in tar.getmembers() if e.isdir()), key=len, default=None)
+    # Find the lowest `binary_distribution` file (hard-coded forward slash is on purpose).
+    binary_distribution = min(
+        (
+            e.name
+            for e in tar.getmembers()
+            if e.isfile() and e.name.endswith(".spack/binary_distribution")
+        ),
+        key=len,
+        default=None,
+    )
 
-    if common_prefix is None:
-        raise ValueError("Tarball does not contain a common prefix")
+    if binary_distribution is None:
+        raise ValueError("Tarball is not a Spack package, missing binary_distribution file")
 
-    # Validate that each file starts with the prefix
+    pkg_path = pathlib.PurePosixPath(binary_distribution).parent.parent
+
+    # Even the most ancient Spack version has required to list the dir of the package itself, so
+    # guard against broken tarballs where `path.parent.parent` is empty.
+    if pkg_path == pathlib.PurePosixPath():
+        raise ValueError("Invalid tarball, missing package prefix dir")
+
+    pkg_prefix = str(pkg_path)
+
+    # Ensure all tar entries are in the pkg_prefix dir, and if they're not, they should be parent
+    # dirs of it.
+    has_prefix = False
     for member in tar.getmembers():
-        if not member.name.startswith(common_prefix):
-            raise ValueError(
-                f"Tarball contains file {member.name} outside of prefix {common_prefix}"
-            )
+        stripped = member.name.rstrip("/")
+        if not (
+            stripped.startswith(pkg_prefix) or member.isdir() and pkg_prefix.startswith(stripped)
+        ):
+            raise ValueError(f"Tarball contains file {stripped} outside of prefix {pkg_prefix}")
+        if member.isdir() and stripped == pkg_prefix:
+            has_prefix = True
 
-    return common_prefix
+    # This is technically not required, but let's be defensive about the existence of the package
+    # prefix dir.
+    if not has_prefix:
+        raise ValueError(f"Tarball does not contain a common prefix {pkg_prefix}")
+
+    return pkg_prefix
 
 
 def install_root_node(spec, unsigned=False, force=False, sha256=None):
@@ -2213,7 +2279,7 @@ def install_root_node(spec, unsigned=False, force=False, sha256=None):
     # don't print long padded paths while extracting/relocating binaries
     with spack.util.path.filter_padding():
         tty.msg('Installing "{0}" from a buildcache'.format(spec.format()))
-        extract_tarball(spec, download_result, unsigned, force)
+        extract_tarball(spec, download_result, force)
         spack.hooks.post_install(spec, False)
         spack.store.STORE.db.add(spec, spack.store.STORE.layout)
 
